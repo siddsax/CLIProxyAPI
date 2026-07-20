@@ -124,6 +124,15 @@ PackyCode provides special discounts for our software users: register using <a h
 
 CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
+### Claude Code with pinned accounts and Codex priority mode
+
+This fork includes a safe account selector and a complete setup guide for pinning one Claude OAuth account and one Codex OAuth account across sessions, configuring GPT reasoning aliases, enabling Codex `service_tier: priority`, and tuning Claude Code compaction:
+
+- [Claude Code: pinned OAuth accounts and Codex priority mode](docs/claude-code-multi-account.md)
+- Account selector: [`tools/cliproxy-select`](tools/cliproxy-select)
+
+Claude Code's `/fast` feature is not enabled for custom GPT model IDs; the documented setup keeps the GPT model selected and uses Codex's priority service tier instead.
+
 ## Management API
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)

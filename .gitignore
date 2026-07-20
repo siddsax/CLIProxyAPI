@@ -14,6 +14,7 @@ temp/*
 refs/*
 plugins/*
 examples/plugin/bin/*
+__pycache__/
 
 # Storage backends
 pgstore/*

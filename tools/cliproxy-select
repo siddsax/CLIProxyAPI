@@ -1,0 +1,637 @@
+#!/usr/bin/env python3
+"""Pin CLIProxyAPI to one Claude and one Codex OAuth credential."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+CONFIG_PATH = Path(
+    os.environ.get("CLIPROXY_CONFIG", str(Path.cwd() / "config.yaml"))
+).expanduser()
+DEFAULT_AUTH_DIR = Path(
+    os.environ.get("CLIPROXY_AUTH_DIR", str(Path.home() / ".cli-proxy-api"))
+).expanduser()
+STATE_DIR = Path(
+    os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+).expanduser() / "cliproxy-select"
+STATE_PATH = STATE_DIR / "state.json"
+LOCK_PATH = STATE_DIR / "lock"
+PROVIDERS = ("claude", "codex")
+MAX_WRITE_ATTEMPTS = 5
+REFRESH_QUIESCENCE_SECONDS = 2.0
+
+
+class SelectorError(RuntimeError):
+    pass
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def resolve_auth_dir() -> Path:
+    try:
+        text = CONFIG_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return DEFAULT_AUTH_DIR
+
+    match = re.search(r'^\s*auth-dir:\s*["\']?([^"\'\n#]+)', text, re.MULTILINE)
+    if not match:
+        return DEFAULT_AUTH_DIR
+    return Path(os.path.expandvars(match.group(1).strip())).expanduser()
+
+
+def ensure_state_dir() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(STATE_DIR, 0o700)
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SelectorError(f"Cannot read valid JSON from {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SelectorError(f"Expected a JSON object in {path}")
+    return value
+
+
+def read_json_with_retry(path: Path) -> dict[str, Any]:
+    last_error: SelectorError | None = None
+    for attempt in range(1, MAX_WRITE_ATTEMPTS + 1):
+        try:
+            return read_json(path)
+        except SelectorError as exc:
+            last_error = exc
+            if attempt < MAX_WRITE_ATTEMPTS:
+                time.sleep(0.2)
+    raise SelectorError(f"Could not read stable credential JSON from {path}: {last_error}")
+
+
+def discover_credentials(
+    auth_dir: Path, *, strict: bool = True
+) -> list[dict[str, Any]]:
+    if not auth_dir.is_dir():
+        raise SelectorError(f"CLIProxyAPI auth directory does not exist: {auth_dir}")
+
+    credentials: list[dict[str, Any]] = []
+    for path in sorted(auth_dir.glob("*.json")):
+        try:
+            data = read_json_with_retry(path)
+        except SelectorError as exc:
+            if strict:
+                raise
+            print(f"warning: skipping {path}: {exc}", file=sys.stderr)
+            continue
+        provider = data.get("type")
+        if provider not in PROVIDERS:
+            continue
+        email = data.get("email")
+        if not isinstance(email, str) or not email:
+            message = f"Credential is missing a valid email: {path}"
+            if strict:
+                raise SelectorError(message)
+            print(f"warning: {message}", file=sys.stderr)
+            continue
+        disabled = data.get("disabled", False)
+        if not isinstance(disabled, bool):
+            message = f"Credential has a non-boolean disabled field: {path}"
+            if strict:
+                raise SelectorError(message)
+            print(f"warning: {message}", file=sys.stderr)
+            continue
+        credentials.append(
+            {
+                "path": path,
+                "filename": path.name,
+                "provider": provider,
+                "email": email,
+                "disabled": disabled,
+                "last_refresh": data.get("last_refresh"),
+                "expired": data.get("expired"),
+                "has_refresh_token": isinstance(data.get("refresh_token"), str)
+                and bool(data.get("refresh_token")),
+            }
+        )
+    return credentials
+
+
+def credentials_by_provider(
+    credentials: list[dict[str, Any]], provider: str
+) -> list[dict[str, Any]]:
+    return [item for item in credentials if item["provider"] == provider]
+
+
+def enabled_by_provider(
+    credentials: list[dict[str, Any]], provider: str
+) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in credentials_by_provider(credentials, provider)
+        if not item["disabled"]
+    ]
+
+
+def resolve_target(
+    credentials: list[dict[str, Any]], provider: str, email: str
+) -> dict[str, Any]:
+    matches = [
+        item
+        for item in credentials_by_provider(credentials, provider)
+        if item["email"].casefold() == email.casefold()
+    ]
+    if len(matches) != 1:
+        candidates = ", ".join(
+            item["email"] for item in credentials_by_provider(credentials, provider)
+        ) or "none"
+        raise SelectorError(
+            f"Expected exactly one {provider} credential for {email!r}; "
+            f"found {len(matches)}. Available: {candidates}"
+        )
+    target = matches[0]
+    if not target["has_refresh_token"]:
+        raise SelectorError(
+            f"Refusing to select {provider} account {target['email']}: "
+            "refresh token is missing"
+        )
+    return target
+
+
+def load_state() -> dict[str, Any] | None:
+    if not STATE_PATH.exists():
+        return None
+    state = read_json(STATE_PATH)
+    if state.get("version") != 1:
+        raise SelectorError(f"Unsupported selector state version in {STATE_PATH}")
+    return state
+
+
+def fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_write_json(path: Path, data: dict[str, Any], mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def write_state(state: dict[str, Any]) -> None:
+    ensure_state_dir()
+    atomic_write_json(STATE_PATH, state, 0o600)
+
+
+def file_signature(path: Path) -> tuple[int, int, int, int]:
+    stat_result = path.stat()
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_mtime_ns,
+        stat_result.st_size,
+    )
+
+
+def set_disabled(path: Path, disabled: bool) -> bool:
+    for attempt in range(1, MAX_WRITE_ATTEMPTS + 1):
+        try:
+            before = file_signature(path)
+            original_mode = path.stat().st_mode & 0o777
+            data = read_json(path)
+        except (OSError, SelectorError) as exc:
+            if attempt == MAX_WRITE_ATTEMPTS:
+                raise SelectorError(f"Could not safely read {path}: {exc}") from exc
+            time.sleep(0.2)
+            continue
+
+        current = data.get("disabled", False)
+        if not isinstance(current, bool):
+            raise SelectorError(f"Credential has a non-boolean disabled field: {path}")
+        if current == disabled:
+            return False
+
+        age_seconds = time.time() - (before[2] / 1_000_000_000)
+        if age_seconds < REFRESH_QUIESCENCE_SECONDS:
+            if attempt == MAX_WRITE_ATTEMPTS:
+                raise SelectorError(f"Credential is being actively refreshed: {path}")
+            time.sleep(
+                min(
+                    REFRESH_QUIESCENCE_SECONDS - age_seconds + 0.2,
+                    REFRESH_QUIESCENCE_SECONDS + 0.2,
+                )
+            )
+            continue
+
+        data["disabled"] = disabled
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, separators=(",", ":"), sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, original_mode)
+
+            try:
+                unchanged = file_signature(path) == before
+            except OSError:
+                unchanged = False
+            if not unchanged:
+                if attempt == MAX_WRITE_ATTEMPTS:
+                    raise SelectorError(
+                        f"Credential kept changing during token refresh: {path}"
+                    )
+                time.sleep(0.2)
+                continue
+
+            os.replace(temporary, path)
+            fsync_directory(path.parent)
+            return True
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    raise SelectorError(f"Could not update credential safely: {path}")
+
+
+def acquire_lock() -> Any:
+    ensure_state_dir()
+    handle = LOCK_PATH.open("a+", encoding="utf-8")
+    os.chmod(LOCK_PATH, 0o600)
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise SelectorError("Another cliproxy-select process is already running") from exc
+    return handle
+
+
+def selected_from_state(state: dict[str, Any] | None) -> dict[str, dict[str, str]]:
+    if not state:
+        return {}
+    selected = state.get("selected", {})
+    if not isinstance(selected, dict):
+        raise SelectorError(f"Invalid selected map in {STATE_PATH}")
+    result: dict[str, dict[str, str]] = {}
+    for provider, value in selected.items():
+        if provider not in PROVIDERS or not isinstance(value, dict):
+            continue
+        email = value.get("email")
+        filename = value.get("filename")
+        if isinstance(email, str) and isinstance(filename, str):
+            result[provider] = {"email": email, "filename": filename}
+    return result
+
+
+def actual_single_selections(
+    credentials: list[dict[str, Any]],
+) -> dict[str, dict[str, str]]:
+    selected: dict[str, dict[str, str]] = {}
+    for provider in PROVIDERS:
+        enabled = enabled_by_provider(credentials, provider)
+        if len(enabled) == 1:
+            selected[provider] = {
+                "email": enabled[0]["email"],
+                "filename": enabled[0]["filename"],
+            }
+    return selected
+
+
+def verify_selection(
+    auth_dir: Path, expected: dict[str, dict[str, str]], providers: set[str]
+) -> None:
+    credentials = discover_credentials(auth_dir)
+    errors: list[str] = []
+    for provider in sorted(providers):
+        enabled = enabled_by_provider(credentials, provider)
+        wanted = expected[provider]
+        if len(enabled) != 1:
+            emails = ", ".join(item["email"] for item in enabled) or "none"
+            errors.append(
+                f"{provider}: expected one enabled account, found {len(enabled)} ({emails})"
+            )
+            continue
+        if (
+            enabled[0]["email"].casefold() != wanted["email"].casefold()
+            or enabled[0]["filename"] != wanted["filename"]
+        ):
+            errors.append(
+                f"{provider}: expected {wanted['email']}, found {enabled[0]['email']}"
+            )
+    if errors:
+        raise SelectorError("Selection verification failed: " + "; ".join(errors))
+
+
+def verify_disabled_snapshot(auth_dir: Path, snapshot: dict[str, bool]) -> None:
+    credentials = discover_credentials(auth_dir)
+    actual = {item["filename"]: item["disabled"] for item in credentials}
+    errors: list[str] = []
+    for filename, disabled in snapshot.items():
+        if filename not in actual:
+            errors.append(f"missing credential {filename}")
+        elif actual[filename] is not disabled:
+            errors.append(
+                f"{filename}: expected disabled={disabled}, found {actual[filename]}"
+            )
+    if errors:
+        raise SelectorError("Rollback verification failed: " + "; ".join(errors))
+
+
+def command_list(args: argparse.Namespace) -> int:
+    credentials = discover_credentials(args.auth_dir, strict=False)
+    if not credentials:
+        print(f"No Claude or Codex credentials found in {args.auth_dir}")
+        return 1
+
+    headers = ("PROVIDER", "ACCOUNT", "STATE", "LAST REFRESH", "EXPIRES")
+    rows = [
+        (
+            item["provider"],
+            item["email"],
+            "disabled" if item["disabled"] else "enabled",
+            str(item["last_refresh"] or "-"),
+            str(item["expired"] or "-"),
+        )
+        for item in credentials
+    ]
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in rows))
+        for index in range(len(headers))
+    ]
+    print("  ".join(headers[index].ljust(widths[index]) for index in range(len(headers))))
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print("  ".join(row[index].ljust(widths[index]) for index in range(len(row))))
+    return 0
+
+
+def command_set(args: argparse.Namespace) -> int:
+    requested = {
+        provider: email
+        for provider, email in (("claude", args.claude), ("codex", args.codex))
+        if email
+    }
+    if not requested:
+        raise SelectorError("set requires --claude EMAIL and/or --codex EMAIL")
+
+    with acquire_lock():
+        credentials = discover_credentials(args.auth_dir)
+        targets = {
+            provider: resolve_target(credentials, provider, email)
+            for provider, email in requested.items()
+        }
+        previous_state = load_state()
+        previous_selected = selected_from_state(previous_state)
+        if not previous_selected:
+            previous_selected = actual_single_selections(credentials)
+
+        selected = dict(previous_selected)
+        for provider, target in targets.items():
+            selected[provider] = {
+                "email": target["email"],
+                "filename": target["filename"],
+            }
+
+        touched = set(targets)
+        for provider in set(PROVIDERS) - touched:
+            provider_credentials = credentials_by_provider(credentials, provider)
+            if not provider_credentials:
+                selected.pop(provider, None)
+                continue
+            enabled = enabled_by_provider(credentials, provider)
+            if len(enabled) != 1:
+                emails = ", ".join(item["email"] for item in enabled) or "none"
+                raise SelectorError(
+                    f"Cannot leave {provider} untouched: expected one enabled account, "
+                    f"found {len(enabled)} ({emails})"
+                )
+            actual = {
+                "email": enabled[0]["email"],
+                "filename": enabled[0]["filename"],
+            }
+            wanted = selected.get(provider)
+            if wanted and (
+                wanted["filename"] != actual["filename"]
+                or wanted["email"].casefold() != actual["email"].casefold()
+            ):
+                raise SelectorError(
+                    f"Persisted {provider} selection has drifted: expected "
+                    f"{wanted['email']}, found {actual['email']}"
+                )
+            selected[provider] = actual
+
+        previous_disabled = {
+            item["filename"]: item["disabled"]
+            for item in credentials
+            if item["provider"] in touched
+        }
+        state = {
+            "version": 1,
+            "updated_at": utc_now(),
+            "selected": selected,
+            "previous": {
+                "selected": previous_selected,
+                "disabled": previous_disabled,
+                "providers": sorted(touched),
+            },
+        }
+        write_state(state)
+
+        changed: list[str] = []
+        for provider, target in targets.items():
+            if set_disabled(target["path"], False):
+                changed.append(f"enabled {provider}:{target['email']}")
+            for item in credentials_by_provider(credentials, provider):
+                if item["filename"] == target["filename"]:
+                    continue
+                if set_disabled(item["path"], True):
+                    changed.append(f"disabled {provider}:{item['email']}")
+
+        verify_selection(args.auth_dir, selected, set(selected))
+
+    if changed:
+        for message in changed:
+            print(message)
+    else:
+        print("Credential files already matched the requested selection")
+    for provider in sorted(targets):
+        print(f"selected {provider}: {targets[provider]['email']}")
+    print(f"selection persisted in {STATE_PATH}")
+    return 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    credentials = discover_credentials(args.auth_dir)
+    state = load_state()
+    selected = selected_from_state(state)
+    drift: list[str] = []
+
+    for provider in PROVIDERS:
+        enabled = enabled_by_provider(credentials, provider)
+        actual = ", ".join(item["email"] for item in enabled) or "none"
+        wanted = selected.get(provider)
+        if wanted:
+            print(f"{provider}: {actual} (selected: {wanted['email']})")
+            if (
+                len(enabled) != 1
+                or enabled[0]["email"].casefold() != wanted["email"].casefold()
+                or enabled[0]["filename"] != wanted["filename"]
+            ):
+                drift.append(provider)
+        else:
+            print(f"{provider}: {actual} (no persisted selection)")
+
+    if state:
+        print(f"state updated: {state.get('updated_at', '-')}")
+    else:
+        print(f"no selector state at {STATE_PATH}")
+
+    if drift:
+        print("drift detected for: " + ", ".join(drift), file=sys.stderr)
+        return 1
+    return 0 if selected else 1
+
+
+def command_rollback(args: argparse.Namespace) -> int:
+    with acquire_lock():
+        state = load_state()
+        if not state:
+            raise SelectorError("No selector state exists to roll back")
+        previous = state.get("previous")
+        if not isinstance(previous, dict):
+            raise SelectorError("State does not contain a rollback snapshot")
+        disabled_snapshot = previous.get("disabled")
+        if not isinstance(disabled_snapshot, dict) or not disabled_snapshot:
+            raise SelectorError("State does not contain disabled values to roll back")
+        if not all(isinstance(name, str) and isinstance(value, bool) for name, value in disabled_snapshot.items()):
+            raise SelectorError("Rollback snapshot is malformed")
+
+        credentials = discover_credentials(args.auth_dir)
+        by_filename = {item["filename"]: item for item in credentials}
+        missing = [name for name in disabled_snapshot if name not in by_filename]
+        if missing:
+            raise SelectorError("Cannot roll back missing credentials: " + ", ".join(missing))
+
+        changed: list[str] = []
+        # Restore enabled files before disabled files to avoid a zero-enabled window.
+        ordered = sorted(disabled_snapshot.items(), key=lambda item: item[1])
+        for filename, disabled in ordered:
+            item = by_filename[filename]
+            if set_disabled(item["path"], disabled):
+                state_name = "disabled" if disabled else "enabled"
+                changed.append(f"{state_name} {item['provider']}:{item['email']}")
+
+        verify_disabled_snapshot(args.auth_dir, disabled_snapshot)
+        restored_credentials = discover_credentials(args.auth_dir)
+        restored_enabled = {
+            provider: [
+                item["email"]
+                for item in enabled_by_provider(restored_credentials, provider)
+            ]
+            for provider in PROVIDERS
+        }
+
+        previous_selected = previous.get("selected")
+        if isinstance(previous_selected, dict) and previous_selected:
+            restored_state = {
+                "version": 1,
+                "updated_at": utc_now(),
+                "selected": previous_selected,
+                "previous": {},
+            }
+            write_state(restored_state)
+        else:
+            try:
+                STATE_PATH.unlink()
+                fsync_directory(STATE_DIR)
+            except FileNotFoundError:
+                pass
+
+    if changed:
+        for message in changed:
+            print(message)
+    else:
+        print("Credential files already matched the rollback snapshot")
+    for provider in PROVIDERS:
+        accounts = ", ".join(restored_enabled[provider]) or "none"
+        print(f"{provider} enabled after rollback: {accounts}")
+    print("rollback snapshot restored")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Select the only active Claude and Codex credentials for CLIProxyAPI"
+    )
+    parser.add_argument(
+        "--auth-dir",
+        type=Path,
+        default=resolve_auth_dir(),
+        help=argparse.SUPPRESS,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    list_parser = subparsers.add_parser("list", help="list credential metadata")
+    list_parser.set_defaults(handler=command_list)
+
+    set_parser = subparsers.add_parser("set", help="persist and apply account selection")
+    set_parser.add_argument("--claude", metavar="EMAIL")
+    set_parser.add_argument("--codex", metavar="EMAIL")
+    set_parser.set_defaults(handler=command_set)
+
+    status_parser = subparsers.add_parser("status", help="show selection and detect drift")
+    status_parser.set_defaults(handler=command_status)
+
+    rollback_parser = subparsers.add_parser("rollback", help="restore state before the last set")
+    rollback_parser.set_defaults(handler=command_rollback)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    args.auth_dir = args.auth_dir.expanduser().resolve()
+    try:
+        return args.handler(args)
+    except (SelectorError, OSError) as exc:
+        print(f"cliproxy-select: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
