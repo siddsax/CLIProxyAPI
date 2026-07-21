@@ -126,12 +126,61 @@ CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
 ### Claude Code with pinned accounts and Codex priority mode
 
-This fork includes a safe account selector and a complete setup guide for pinning one Claude OAuth account and one Codex OAuth account across sessions, configuring GPT reasoning aliases, enabling Codex `service_tier: priority`, and tuning Claude Code compaction:
+This fork adds:
 
-- [Claude Code: pinned OAuth accounts and Codex priority mode](docs/claude-code-multi-account.md)
-- Account selector: [`tools/cliproxy-select`](tools/cliproxy-select)
+- persistent selection of exactly one Claude OAuth account and one Codex OAuth account using the credential `disabled` field;
+- `gpt-5.6-sol`, `gpt-5.6-sol-medium`, and `gpt-5.6-sol-low` reasoning-effort routes; and
+- Codex `service_tier: priority` for all three GPT routes—the Codex-side alternative to Claude Code Fast Mode.
 
-Claude Code's `/fast` feature is not enabled for custom GPT model IDs; the documented setup keeps the GPT model selected and uses Codex's priority service tier instead.
+#### Quick setup
+
+```bash
+export CLIPROXY_CONFIG=/path/to/config.yaml
+
+# Run each login once per account.
+cli-proxy-api -config "$CLIPROXY_CONFIG" -claude-login -no-browser
+cli-proxy-api -config "$CLIPROXY_CONFIG" -codex-device-login
+
+mkdir -p ~/.local/bin
+install -m 755 tools/cliproxy-select ~/.local/bin/cliproxy-select
+
+cliproxy-select list
+cliproxy-select set \
+  --claude claude-user@example.com \
+  --codex codex-user@example.com
+cliproxy-select status
+```
+
+Copy the ready-to-paste alias and payload-override YAML from [`AGENT_SETUP.md`](AGENT_SETUP.md#4-configure-reasoning-aliases-and-priority-routing) into your private `config.yaml`; [`config.example.yaml`](config.example.yaml) contains the broader reference examples. Do not commit `config.yaml`, OAuth credential files, or real API keys.
+
+Point Claude Code at the local proxy with user-level settings like:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8317",
+    "ANTHROPIC_AUTH_TOKEN": "YOUR_LOCAL_CLIPROXY_API_KEY",
+    "ANTHROPIC_MODEL": "gpt-5.6-sol",
+    "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.6-sol",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "272000",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "90"
+  },
+  "model": "gpt-5.6-sol",
+  "fastMode": false,
+  "autoCompactEnabled": true
+}
+```
+
+The compaction settings trigger at approximately 244,800 tokens (`272000 × 90%`). They tune Claude Code's compaction calculation; they do not increase the upstream model's context limit.
+
+> **Do not enable Claude Code `/fast` for custom GPT model IDs.** It is model-gated to supported Anthropic models and can switch the session to an Opus model. Keep `gpt-5.6-sol` selected and use Codex `service_tier: priority` instead.
+
+Full references:
+
+- [Agent-readable setup procedure](AGENT_SETUP.md)
+- [Detailed operator guide](docs/claude-code-multi-account.md)
+- [Account selector](tools/cliproxy-select)
+- [Configuration examples](config.example.yaml)
 
 ## Management API
 
