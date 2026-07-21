@@ -39,6 +39,51 @@ export CLIPROXY_CONFIG=/path/to/config.yaml
 
 The selector reads `auth-dir` from this file. If it cannot find a configured directory, it defaults to `~/.cli-proxy-api`.
 
+## Operating model policy
+
+This fork's model routes are intended for a three-model agent workflow:
+
+| Model | Responsibility |
+| --- | --- |
+| `gpt-5.6-sol` | Main execution manager: task breakdown, implementation, integration, testing, and final reporting. |
+| `gpt-5.6-sol-medium` / `gpt-5.6-sol-low` | Bounded mechanical execution where full high reasoning is unnecessary. |
+| Claude Fable 5 | Architecture, planning, contracts, senior-engineer review, and review of user-facing behavior. |
+| Claude Sonnet 5 | Read-only codebase exploration, flow tracing, and API inventory. |
+
+Do not substitute Opus 4.8 or Haiku. Do not use Sonnet for implementation or review, and do not use Fable as a general implementation worker.
+
+For substantive work, follow this loop:
+
+1. Use Fable to produce or refine a concrete execution brief.
+2. Keep the current `gpt-5.6-sol` session as the execution manager.
+3. Give mutating workers bounded scopes and non-overlapping file ownership.
+4. Integrate changes and run combined verification in the main session.
+5. Use Fable to review the actual diff and verification evidence.
+6. Apply findings and repeat until the review and required checks are clean.
+
+Do not launch a second headless execution manager merely to obtain another Sol session. Use a separate session only when the work requires an independently resumable lifecycle or strict isolation that a bounded subagent cannot provide.
+
+## How model and account selection work
+
+```text
+model ID selected by Claude Code or a subagent
+  → provider/protocol selection
+  → enabled OAuth credential for the selected provider
+  → provider-specific model alias resolution
+  → matching payload overrides, applied in order
+  → reasoning effort and service tier
+  → upstream request
+```
+
+The `gpt-5.6-sol*` model IDs use the Codex protocol. Their proxy-side payload rules enforce high, medium, or low `reasoning.effort` and add `service_tier: priority`. Fable 5 and Sonnet 5 use the Claude provider route. The exact client-facing Claude model alias may depend on the Claude Code installation, but it must resolve to the real Claude model rather than a GPT substitute.
+
+Model selection and account selection are separate:
+
+- **Model selection is per request.** The client or agent chooses a model ID, which determines the provider route and configured request behavior.
+- **Account selection is global per proxy instance.** `cliproxy-select` enables exactly one OAuth credential for the Claude and Codex providers.
+
+Selecting `gpt-5.6-sol-medium` does not choose a different Codex account; it changes the enforced effort while retaining the pinned Codex credential. Selecting Fable or Sonnet switches to the Claude provider and therefore uses the pinned Claude credential.
+
 ## 1. Authenticate each account
 
 Run the Claude OAuth login once for every Claude account the operator wants available:

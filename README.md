@@ -120,6 +120,58 @@ PackyCode provides special discounts for our software users: register using <a h
 - OpenAI-compatible upstream providers via config (e.g., OpenRouter)
 - Reusable Go SDK for embedding the proxy (see `docs/sdk-usage.md`)
 
+## What is more in this fork
+
+This fork packages an opinionated Claude Code setup on top of CLIProxyAPI: deterministic reasoning-effort routes, one explicitly pinned OAuth account for Claude and Codex, and a three-model operating policy for coding-agent workflows. The `gpt-5.6-sol-medium` and `gpt-5.6-sol-low` variants are local aliases forked from the configured base `gpt-5.6-sol` model.
+
+### Fork additions at a glance
+
+- Pin exactly one Claude OAuth account and one Codex OAuth account by enabling one credential per provider.
+- Select high, medium, or low GPT reasoning through `gpt-5.6-sol`, `gpt-5.6-sol-medium`, and `gpt-5.6-sol-low`.
+- Apply Codex `service_tier: priority` consistently to all three GPT routes.
+- Use a documented staffing policy that separates execution, design/review, and read-only exploration.
+- Keep model selection and account selection deterministic but independently controllable.
+
+### Three-model operating policy
+
+| Model | Role |
+| --- | --- |
+| `gpt-5.6-sol` high / medium / low | Execution. The current session owns the task graph, implementation, integration, and verification. Medium and low are reserved for bounded mechanical work. |
+| Claude Fable 5 | Design and senior-engineer review. It owns architecture, contracts, planning, and taste review for user-facing changes. |
+| Claude Sonnet 5 | Read-only exploration. It locates code, traces flows, and inventories APIs; it does not implement or review changes. |
+
+The policy these routes are designed to support is:
+
+1. The current interactive `gpt-5.6-sol` session is the execution manager; do not launch another headless manager by default.
+2. Mutating workers receive bounded scopes, explicit file ownership, and concrete verification requirements.
+3. Fable designs substantive work before implementation and reviews the finished diff afterward.
+4. Sonnet is restricted to read-only search and exploration.
+5. Opus 4.8 and Haiku are deliberately excluded: Fable handles judgment and Sonnet handles exploration.
+
+### How model selection happens
+
+```text
+client model ID
+  → provider/protocol route (Codex or Claude)
+  → the enabled OAuth credential for that provider
+  → provider-specific model alias resolution
+  → payload override rules; later matching rules win
+  → reasoning effort and service tier
+  → upstream account
+```
+
+For example, a request for `gpt-5.6-sol-medium` follows the Codex route. The alias resolves to the configured base GPT model, then the later alias-specific payload rule sets `reasoning.effort: medium` and `service_tier: priority`. Finally, CLIProxyAPI sends the request through the currently enabled Codex credential.
+
+Requests for Fable 5 or Sonnet 5 follow the Claude provider route and use the currently enabled Claude credential. The client or subagent chooses the model role; CLIProxyAPI chooses the matching provider, applies its configured payload rules, and supplies the enabled provider credential.
+
+Clients do not need to set GPT reasoning effort separately. The selected `gpt-5.6-sol*` model ID is the effort selector, and the proxy enforces the corresponding value for Claude Code, subagents, and direct API clients. See [the exact alias and payload configuration](AGENT_SETUP.md#4-configure-reasoning-aliases-and-priority-routing).
+
+### Model selection versus account selection
+
+Model selection is per request: the model ID determines the provider route, reasoning effort, and service tier. Account selection is global per proxy instance: `cliproxy-select` controls which OAuth credential is enabled for the Claude and Codex providers. Changing models does not change accounts, and pinning an account does not change model behavior; both mechanisms are independent and together provide deterministic reasoning and quota routing.
+
+A newly authenticated credential starts enabled. Run `cliproxy-select status` and reapply the intended selection after adding any account.
+
 ## Getting Started
 
 CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
