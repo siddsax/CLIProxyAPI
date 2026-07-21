@@ -130,6 +130,7 @@ This fork packages an opinionated Claude Code setup on top of CLIProxyAPI: deter
 - Select high, medium, or low GPT reasoning through `gpt-5.6-sol`, `gpt-5.6-sol-medium`, and `gpt-5.6-sol-low`.
 - Apply Codex `service_tier: priority` consistently to all three GPT routes.
 - Use a documented staffing policy that separates execution, design/review, and read-only exploration.
+- Start from a copyable [`CLAUDE.example.md`](CLAUDE.example.md) containing the model roles, staffing rules, execution loop, routing behavior, and safety constraints.
 - Keep model selection and account selection deterministic but independently controllable.
 
 ### Three-model operating policy
@@ -147,6 +148,18 @@ The policy these routes are designed to support is:
 3. Fable designs substantive work before implementation and reviews the finished diff afterward.
 4. Sonnet is restricted to read-only search and exploration.
 5. Opus 4.8 and Haiku are deliberately excluded: Fable handles judgment and Sonnet handles exploration.
+
+### Sample `CLAUDE.md`
+
+[`CLAUDE.example.md`](CLAUDE.example.md) is a sanitized, copyable version of this fork's model and agent policy. It includes model roles, suggested subagent routing, the Fable → Sol → Fable execution loop, session-management rules, CLIProxyAPI settings, account-selection behavior, and credential-safety constraints.
+
+For a new project-level policy, copy it only when a `CLAUDE.md` does not already exist:
+
+```bash
+test -e CLAUDE.md || cp CLAUDE.example.md CLAUDE.md
+```
+
+For an existing project or global Claude Code policy, review and merge the relevant sections rather than overwriting the existing file. The sample contains placeholders only and must never be populated with a real API key or OAuth token.
 
 ### How model selection happens
 
@@ -229,6 +242,7 @@ The compaction settings trigger at approximately 244,800 tokens (`272000 × 90%`
 
 Full references:
 
+- [Sample Claude Code policy](CLAUDE.example.md)
 - [Agent-readable setup procedure](AGENT_SETUP.md)
 - [Detailed operator guide](docs/claude-code-multi-account.md)
 - [Account selector](tools/cliproxy-select)

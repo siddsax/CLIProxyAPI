@@ -257,6 +257,7 @@ Troubleshooting:
 ## File map
 
 - [Main README](README.md)
+- [Sample Claude Code policy](CLAUDE.example.md)
 - [Detailed operator guide](docs/claude-code-multi-account.md)
 - [Account selector](tools/cliproxy-select)
 - [Configuration examples](config.example.yaml)
